@@ -80,6 +80,13 @@ else
   info "using cached FFmpegKit release $version"
 fi
 
+# When building the sideloaded IPA, stage the frameworks after cyan runs.
+# This prevents cyan from treating them as additional injected libraries.
+if [[ "${YOUMOD_FFMPEG_POSTPACK:-0}" == "1" ]]; then
+  info "FFmpeg frameworks cached for post-cyan packaging; skipping tweak-bundle stage"
+  exit 0
+fi
+
 BUNDLE="$(find "$STAGING" -type d -name 'YouMod.bundle' -print -quit 2>/dev/null || true)"
 [[ -n "$BUNDLE" ]] || die "no YouMod.bundle under $STAGING"
 
