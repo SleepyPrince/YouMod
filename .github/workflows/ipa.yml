@@ -293,7 +293,7 @@ jobs:
         run: |
           cd YouMod
           echo "YOUMOD_VERSION=$(grep '^Version:' control | cut -d ' ' -f2)" >> $GITHUB_ENV
-          make clean package DEBUG=0 FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+          YOUMOD_FFMPEG_POSTPACK=1 make clean package DEBUG=0 FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
           mv packages/*.deb ${{ github.workspace }}/youmod.deb
 
       - name: Build YouPiP
@@ -404,6 +404,17 @@ jobs:
           done
           
           cyan -i youtube.ipa -o YouMod_${{ env.YT_VERSION }}_v${{ env.YOUMOD_VERSION }}.ipa -uwef $tweaks -n "${{ inputs.display_name }}" -b ${{ inputs.bundle_id }}
+
+      - name: Append FFmpeg resources (without Mach-O injection)
+        run: |
+          python3 YouMod/tools/postpack-ffmpeg.py \
+            "YouMod_${{ env.YT_VERSION }}_v${{ env.YOUMOD_VERSION }}.ipa" \
+            "YouMod/.cache/ffmpegkit/modules/ffmpegkit"
+
+      - name: Validate main Mach-O header
+        run: |
+          python3 YouMod/tools/check-macho-overlap.py \
+            "YouMod_${{ env.YT_VERSION }}_v${{ env.YOUMOD_VERSION }}.ipa"
 
       - name: Create a Draft Release
         uses: softprops/action-gh-release@v3
