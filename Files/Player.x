@@ -1,5 +1,96 @@
 #import "Headers.h"
 
+#pragma mark - YouMod fake brightness (below system minimum)
+
+// This overlay affects YouTube only; it never changes other apps' brightness.
+// At the minimum system setting, the gesture extends into the negative range.
+static const CGFloat kYouModFakeBrightnessExtraRange = 0.5;
+static const CGFloat kYouModFakeBrightnessMaxOpacity = 0.70;
+static UIView *YouModFakeBrightnessOverlay = nil;
+static CGFloat YouModFakeBrightnessOpacity = 0.0;
+
+static UIWindow *YouModFakeBrightnessWindow(UIWindow *preferredWindow) {
+    if (preferredWindow) return preferredWindow;
+    // UIApplication.keyWindow is deprecated since iOS 13 and the build uses
+    // -Werror, so look the window up through the connected scenes instead.
+    UIApplication *application = [UIApplication sharedApplication];
+    UIWindow *fallback = nil;
+    for (UIScene *scene in application.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *candidate in ((UIWindowScene *)scene).windows) {
+            if (candidate.hidden || candidate.windowLevel != UIWindowLevelNormal) continue;
+            if (candidate.isKeyWindow) return candidate;
+            if (!fallback) fallback = candidate;
+        }
+    }
+    if (fallback) return fallback;
+    if ([application.delegate respondsToSelector:@selector(window)]) {
+        return application.delegate.window;
+    }
+    return nil;
+}
+
+static void YouModFakeBrightnessAttach(UIWindow *window) {
+    if (!window || YouModFakeBrightnessOpacity <= 0.0) return;
+    if (!YouModFakeBrightnessOverlay) {
+        YouModFakeBrightnessOverlay = [[UIView alloc] initWithFrame:window.bounds];
+        YouModFakeBrightnessOverlay.backgroundColor = UIColor.blackColor;
+        YouModFakeBrightnessOverlay.userInteractionEnabled = NO;
+        YouModFakeBrightnessOverlay.accessibilityElementsHidden = YES;
+        YouModFakeBrightnessOverlay.autoresizingMask =
+            UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        YouModFakeBrightnessOverlay.layer.zPosition = CGFLOAT_MAX;
+    }
+    if (YouModFakeBrightnessOverlay.superview != window) {
+        [YouModFakeBrightnessOverlay removeFromSuperview];
+        YouModFakeBrightnessOverlay.frame = window.bounds;
+        [window addSubview:YouModFakeBrightnessOverlay];
+    }
+    YouModFakeBrightnessOverlay.alpha = YouModFakeBrightnessOpacity;
+}
+
+static void YouModFakeBrightnessSetOpacity(CGFloat opacity, UIWindow *preferredWindow) {
+    // UIKit gesture recognizers call this on the main thread.
+    YouModFakeBrightnessOpacity = fmax(0.0, fmin(kYouModFakeBrightnessMaxOpacity, opacity));
+    if (YouModFakeBrightnessOpacity <= 0.0) {
+        [YouModFakeBrightnessOverlay removeFromSuperview];
+        // Retain the view for reuse without creating duplicates.
+        YouModFakeBrightnessOverlay.alpha = 0.0;
+        return;
+    }
+    YouModFakeBrightnessAttach(YouModFakeBrightnessWindow(preferredWindow));
+}
+
+static void YouModFakeBrightnessInstallObservers(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+        // If the user raises system brightness from Control Center while fake
+        // dimming is active, don't leave the app artificially dark.
+        [center addObserverForName:UIScreenBrightnessDidChangeNotification
+                          object:[UIScreen mainScreen]
+                           queue:[NSOperationQueue mainQueue]
+                      usingBlock:^(NSNotification *notification) {
+            if (YouModFakeBrightnessOpacity > 0.0 && [UIScreen mainScreen].brightness > 0.001) {
+                YouModFakeBrightnessSetOpacity(0.0, nil);
+            }
+        }];
+        // Reattach when the normal application window changes (e.g. iPad scene).
+        [center addObserverForName:UIWindowDidBecomeKeyNotification
+                          object:nil
+                           queue:[NSOperationQueue mainQueue]
+                      usingBlock:^(NSNotification *notification) {
+            UIWindow *window = notification.object;
+            if ([window isKindOfClass:[UIWindow class]] &&
+                window.windowLevel == UIWindowLevelNormal &&
+                YouModFakeBrightnessOpacity > 0.0) {
+                YouModFakeBrightnessAttach(window);
+            }
+        }];
+    });
+}
+
+
 static BOOL isWiFiConnected() {
     struct sockaddr_in zeroAddress;
     bzero(&zeroAddress, sizeof(zeroAddress));
@@ -834,6 +925,7 @@ static CGFloat remainingOverlayWidth(YTPlayerViewController *pvc, CGFloat fullWi
     
     static float initialVolume;
     static float initialBrightness;
+    static float initialVirtualBrightness;
     static float initialSpeed;
     static int controlType = 0;
     static CGFloat deadzoneStartingTranslation;
@@ -911,7 +1003,19 @@ static CGFloat remainingOverlayWidth(YTPlayerViewController *pvc, CGFloat fullWi
             
             deadzoneStartingTranslation = [panGestureRecognizer translationInView:self.view].y;
             
-            if (controlType == 1) initialBrightness = [UIScreen mainScreen].brightness;
+            if (controlType == 1) {
+                YouModFakeBrightnessInstallObservers();
+                initialBrightness = [UIScreen mainScreen].brightness;
+                // A Control Center change may have raised the physical screen
+                // while a dimming layer was active; respect the new brightness.
+                if (initialBrightness > 0.001f && YouModFakeBrightnessOpacity > 0.0) {
+                    YouModFakeBrightnessSetOpacity(0.0, self.view.window);
+                }
+                // Preserve the fake dimming level between separate swipes.
+                initialVirtualBrightness = initialBrightness -
+                    (YouModFakeBrightnessOpacity / kYouModFakeBrightnessMaxOpacity) *
+                    kYouModFakeBrightnessExtraRange;
+            }
             else if (controlType == 2) initialVolume = [[AVAudioSession sharedInstance] outputVolume];
             else if (controlType == 3) initialSpeed = [ovcon currentPlaybackRate];
 
@@ -952,18 +1056,39 @@ static CGFloat remainingOverlayWidth(YTPlayerViewController *pvc, CGFloat fullWi
             NSString *percentString = nil;
 
             if (controlType == 1) {
-                float newBrightness = fmaxf(fminf(initialBrightness + delta, 1.0), 0.0);
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    [[UIScreen mainScreen] setBrightness:newBrightness];
-                });
-                
-                if (newBrightness <= 0.5f) {
-                    symbolName = @"sun.min.fill";
+                // One continuous range: [-extra, 0) = fake dimming;
+                // [0, 1] = normal UIScreen brightness. No dead zone at 0.
+                float virtualBrightness = fmaxf(fminf(initialVirtualBrightness + delta, 1.0f),
+                                                -kYouModFakeBrightnessExtraRange);
+                float newBrightness = fmaxf(virtualBrightness, 0.0f);
+                UIScreen *screen = [UIScreen mainScreen];
+
+                if (virtualBrightness < 0.0f) {
+                    // Downward: get the physical display to its minimum first.
+                    if (screen.brightness > 0.0005f) screen.brightness = 0.0f;
+                    CGFloat dimFraction = -virtualBrightness / kYouModFakeBrightnessExtraRange;
+                    YouModFakeBrightnessSetOpacity(dimFraction * kYouModFakeBrightnessMaxOpacity,
+                                                  self.view.window);
+                    symbolName = @"moon.fill";
+                    percentString = [NSString stringWithFormat:@" Dim %d%%",
+                                     (int)lround(dimFraction * 100.0)];
+                    if (IS_ENABLED(GestureHUD) && self.YouModGestureHUD) {
+                        CGRect frame = self.YouModGestureHUD.frame;
+                        CGPoint hudCenter = self.YouModGestureHUD.center;
+                        frame.size.width = fmax(frame.size.width, 112.0);
+                        self.YouModGestureHUD.frame = frame;
+                        self.YouModGestureHUD.center = hudCenter;
+                    }
                 } else {
-                    symbolName = @"sun.max.fill";
+                    // Upward: remove all fake dimming before raising the display.
+                    YouModFakeBrightnessSetOpacity(0.0, self.view.window);
+                    if (fabs(screen.brightness - newBrightness) > 0.0005f) {
+                        screen.brightness = newBrightness;
+                    }
+                    symbolName = newBrightness <= 0.5f ? @"sun.min.fill" : @"sun.max.fill";
+                    percentString = [NSString stringWithFormat:@" %d%%",
+                                     (int)lround(newBrightness * 100.0f)];
                 }
-                
-                percentString = [NSString stringWithFormat:@" %d%%", (int)(newBrightness * 100)];
             } else if (controlType == 2) {
                 float newVolume = fmaxf(fminf(initialVolume + delta, 1.0), 0.0);
                 dispatch_async(dispatch_get_main_queue(), ^{
