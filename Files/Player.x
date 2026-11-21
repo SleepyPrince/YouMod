@@ -647,36 +647,201 @@ static CGFloat YouModSpeedForHoldIndex(NSInteger index) {
     return [values[index] floatValue];
 }
 
-#pragma mark - Hide the live chat entry pill (viewer count) in fullscreen
+#pragma mark - TEMPORARY debug: copy the player view tree to the clipboard
 
-// In fullscreen live streams the bottom-right pill that shows the viewer count
-// is the live chat entry point (id.livechat.fullscreen_entrypoint). It lives
-// inside YCHLiveChatFullscreenOverlayView, so hide it when that view lays out.
-@interface YCHLiveChatFullscreenOverlayView : UIView
+// Hold three fingers on the player for one second. Copies (1) every view or
+// view controller that looks related to the viewer count, with its chain of
+// parent classes, and (2) the views in the bottom-right of the screen.
+// Remove this section once the badge has been identified.
+static NSString *YouModDebugColor(UIColor *color) {
+    if (!color) return nil;
+    CGFloat r = 0, g = 0, b = 0, a = 0;
+    if (![color getRed:&r green:&g blue:&b alpha:&a]) return @"?";
+    if (a < 0.01) return nil;
+    return [NSString stringWithFormat:@"%.2f,%.2f,%.2f,%.2f", r, g, b, a];
+}
+
+static void YouModDebugCheckObject(id object, NSString *kind, UIView *view, NSMutableString *out) {
+    NSArray<NSString *> *names = @[@"viewerCountLabel", @"viewerCountImageView", @"concurrentViewersString",
+                                   @"viewersWaitingView", @"viewersWaitingCountLabel"];
+    NSMutableArray<NSString *> *hits = [NSMutableArray array];
+    for (NSString *name in names) {
+        if ([object respondsToSelector:NSSelectorFromString(name)]) [hits addObject:name];
+    }
+    if (hits.count == 0) return;
+    NSMutableArray<NSString *> *chain = [NSMutableArray array];
+    UIView *walk = view;
+    for (int i = 0; walk && i < 8; i++) {
+        [chain addObject:NSStringFromClass([walk class])];
+        walk = walk.superview;
+    }
+    [out appendFormat:@"%@ %@ props=%@ chain=%@\n", kind, NSStringFromClass([object class]),
+        [hits componentsJoinedByString:@","], [chain componentsJoinedByString:@" < "]];
+}
+
+static NSString *YouModDebugTrim(NSString *text) {
+    return text.length > 40 ? [text substringToIndex:40] : text;
+}
+
+// Texture (AsyncDisplayKit) draws text and icons from nodes, not subviews.
+static id YouModDebugNode(UIView *view) {
+    if (![view respondsToSelector:NSSelectorFromString(@"asyncdisplaykit_node")]) return nil;
+    return [view valueForKey:@"asyncdisplaykit_node"];
+}
+
+static id YouModDebugValue(id object, NSString *getter) {
+    if (!object || ![object respondsToSelector:NSSelectorFromString(getter)]) return nil;
+    return [object valueForKey:getter];
+}
+
+static NSString *YouModDebugNodeSummary(id node) {
+    NSMutableString *summary = [NSMutableString stringWithFormat:@"node=%@", NSStringFromClass([node class])];
+    id attributed = YouModDebugValue(node, @"attributedText");
+    if ([attributed isKindOfClass:[NSAttributedString class]]) {
+        NSString *text = ((NSAttributedString *)attributed).string;
+        if (text.length) [summary appendFormat:@" text=\"%@\"", YouModDebugTrim(text)];
+    }
+    id label = YouModDebugValue(node, @"accessibilityLabel");
+    if ([label isKindOfClass:[NSString class]] && [label length]) {
+        [summary appendFormat:@" acc=\"%@\"", YouModDebugTrim(label)];
+    }
+    if (YouModDebugValue(node, @"image")) [summary appendString:@" [image]"];
+    id color = YouModDebugValue(node, @"backgroundColor");
+    if ([color isKindOfClass:[UIColor class]]) {
+        NSString *background = YouModDebugColor(color);
+        if (background) [summary appendFormat:@" bg=%@", background];
+    }
+    return summary;
+}
+
+// Only layer-backed subnodes are printed: view-backed ones appear as views.
+static void YouModDebugAppendNodes(id node, NSInteger depth, NSInteger *budget, NSMutableString *out) {
+    id subnodes = YouModDebugValue(node, @"subnodes");
+    if (![subnodes isKindOfClass:[NSArray class]]) return;
+    for (id sub in (NSArray *)subnodes) {
+        if ((*budget)-- <= 0) return;
+        id layerBacked = YouModDebugValue(sub, @"isLayerBacked");
+        if (![layerBacked isKindOfClass:[NSNumber class]] || ![layerBacked boolValue]) continue;
+        NSMutableString *line = [NSMutableString string];
+        for (NSInteger i = 0; i < depth; i++) [line appendString:@" "];
+        [line appendFormat:@"+ %@", YouModDebugNodeSummary(sub)];
+        [out appendFormat:@"%@\n", line];
+        YouModDebugAppendNodes(sub, depth + 1, budget, out);
+    }
+}
+
+static void YouModDebugCollect(UIView *view, NSMutableString *out, NSInteger *budget) {
+    if ((*budget)-- <= 0) return;
+    YouModDebugCheckObject(view, @"VIEW", view, out);
+    id node = YouModDebugNode(view);
+    if (node) YouModDebugCheckObject(node, @"NODE", view, out);
+    UIResponder *next = view.nextResponder;
+    if ([next isKindOfClass:[UIViewController class]]) {
+        YouModDebugCheckObject(next, @"CONTROLLER", view, out);
+    }
+    NSString *identifier = view.accessibilityIdentifier.lowercaseString;
+    NSString *label = view.accessibilityLabel.lowercaseString;
+    if ([identifier containsString:@"watching"] || [identifier containsString:@"viewer"] ||
+        [identifier containsString:@"concurrent"] || [label containsString:@"watching"] ||
+        [label containsString:@"viewer"]) {
+        [out appendFormat:@"IDENTIFIER id=%@ label=%@ class=%@\n", view.accessibilityIdentifier,
+            view.accessibilityLabel, NSStringFromClass([view class])];
+    }
+    for (UIView *sub in view.subviews) YouModDebugCollect(sub, out, budget);
+}
+
+static void YouModDebugAppendTree(UIView *view, UIView *root, CGRect region, NSInteger depth, NSInteger *budget, NSMutableString *out) {
+    CGRect frame = [view convertRect:view.bounds toView:root];
+    if (!CGRectIntersectsRect(frame, region)) return;
+    if ((*budget)-- <= 0) return;
+    NSMutableString *line = [NSMutableString string];
+    for (NSInteger i = 0; i < depth; i++) [line appendString:@" "];
+    [line appendFormat:@"%@ (%.0f,%.0f %.0fx%.0f)", NSStringFromClass([view class]),
+        frame.origin.x, frame.origin.y, frame.size.width, frame.size.height];
+    if (view.hidden) [line appendString:@" hidden"];
+    if (view.alpha < 1.0) [line appendFormat:@" a=%.2f", view.alpha];
+    NSString *background = YouModDebugColor(view.backgroundColor);
+    if (background) [line appendFormat:@" bg=%@", background];
+    if (view.accessibilityIdentifier.length) [line appendFormat:@" id=%@", view.accessibilityIdentifier];
+    if (view.accessibilityLabel.length) [line appendFormat:@" acc=\"%@\"", YouModDebugTrim(view.accessibilityLabel)];
+    if ([view isKindOfClass:[UILabel class]]) {
+        NSString *text = ((UILabel *)view).text;
+        if (text.length) [line appendFormat:@" text=\"%@\"", YouModDebugTrim(text)];
+    }
+    if ([view isKindOfClass:[UIImageView class]]) [line appendString:@" [image]"];
+    id node = YouModDebugNode(view);
+    if (node) [line appendFormat:@" %@", YouModDebugNodeSummary(node)];
+    [out appendFormat:@"%@\n", line];
+    if (node) YouModDebugAppendNodes(node, depth + 1, budget, out);
+    for (UIView *sub in view.subviews) YouModDebugAppendTree(sub, root, region, depth + 1, budget, out);
+}
+
+static void YouModDebugCopyViewTree(UIView *overlay) {
+    UIView *root = overlay.window ?: overlay.superview ?: overlay;
+    CGSize size = root.bounds.size;
+    NSMutableString *out = [NSMutableString string];
+    [out appendFormat:@"YouMod view dump. overlay=%@ root=%@ size=%.0fx%.0f\n",
+        NSStringFromClass([overlay class]), NSStringFromClass([root class]), size.width, size.height];
+
+    [out appendString:@"== CANDIDATES ==\n"];
+    NSInteger budget = 5000;
+    YouModDebugCollect(root, out, &budget);
+
+    [out appendString:@"== TREE (bottom 55%) ==\n"];
+    CGRect region = CGRectMake(0, size.height * 0.45, size.width, size.height * 0.55);
+    budget = 1200;
+    YouModDebugAppendTree(root, root, region, 0, &budget, out);
+
+    [UIPasteboard generalPasteboard].string = out;
+
+    UINotificationFeedbackGenerator *haptic = [[UINotificationFeedbackGenerator alloc] init];
+    [haptic notificationOccurred:UINotificationFeedbackTypeSuccess];
+
+    UILabel *toast = [[UILabel alloc] init];
+    toast.text = [NSString stringWithFormat:@"  Copied %lu characters  ", (unsigned long)out.length];
+    toast.textColor = [UIColor whiteColor];
+    toast.backgroundColor = [UIColor colorWithWhite:0 alpha:0.8];
+    toast.font = [UIFont boldSystemFontOfSize:14];
+    toast.layer.cornerRadius = 8;
+    toast.clipsToBounds = YES;
+    [toast sizeToFit];
+    toast.frame = CGRectInset(toast.frame, 0, -8);
+    toast.center = CGPointMake(size.width / 2, size.height * 0.25);
+    [root addSubview:toast];
+    [UIView animateWithDuration:0.4 delay:1.5 options:0 animations:^{ toast.alpha = 0; } completion:^(BOOL finished) {
+        [toast removeFromSuperview];
+    }];
+}
+
+@interface YouModViewDump : NSObject
++ (instancetype)shared;
+- (void)handle:(UILongPressGestureRecognizer *)gesture;
 @end
 
-static BOOL YouModHideLiveChatEntryPoint(UIView *parent, UIView *overlay) {
-    for (UIView *sub in parent.subviews) {
-        if ([sub.accessibilityIdentifier isEqualToString:@"id.livechat.fullscreen_entrypoint"]) {
-            // Texture wraps it in a same-sized parent; hide the outermost wrapper.
-            UIView *box = sub;
-            while (box.superview && box.superview != overlay && box.superview.subviews.count == 1) {
-                box = box.superview;
-            }
-            if (!box.hidden) box.hidden = YES;
-            return YES;
-        }
-        if (YouModHideLiveChatEntryPoint(sub, overlay)) return YES;
-    }
-    return NO;
+@implementation YouModViewDump
++ (instancetype)shared {
+    static YouModViewDump *instance;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ instance = [[YouModViewDump alloc] init]; });
+    return instance;
 }
+- (void)handle:(UILongPressGestureRecognizer *)gesture {
+    if (gesture.state != UIGestureRecognizerStateBegan || !gesture.view) return;
+    YouModDebugCopyViewTree(gesture.view);
+}
+@end
 
-%hook YCHLiveChatFullscreenOverlayView
-- (void)layoutSubviews {
-    %orig;
-    YouModHideLiveChatEntryPoint(self, self);
+static void YouModDebugInstallGesture(UIView *overlay) {
+    for (UIGestureRecognizer *existing in overlay.gestureRecognizers) {
+        if ([existing.name isEqualToString:@"YouModDebugDump"]) return;
+    }
+    UILongPressGestureRecognizer *press = [[UILongPressGestureRecognizer alloc] initWithTarget:[YouModViewDump shared] action:@selector(handle:)];
+    press.name = @"YouModDebugDump";
+    press.numberOfTouchesRequired = 3;
+    press.minimumPressDuration = 1.0;
+    press.cancelsTouchesInView = NO;
+    [overlay addGestureRecognizer:press];
 }
-%end
 
 %hook YTMainAppVideoPlayerOverlayView
 - (void)setLongPressGestureRecognizer:(id)arg {
@@ -697,6 +862,7 @@ static BOOL YouModHideLiveChatEntryPoint(UIView *parent, UIView *overlay) {
 - (void)layoutSubviews {
     %orig;
     if (IS_ENABLED(HideCastButtonPlayer)) self.playbackRouteButton.hidden = YES;
+    YouModDebugInstallGesture(self);
 }
 %end
 
