@@ -650,14 +650,19 @@ static CGFloat YouModSpeedForHoldIndex(NSInteger index) {
 #pragma mark - Move the live chat entry pill (viewer count) next to the Live button
 
 // In fullscreen live streams the bottom-right pill showing the viewer count is
-// the live chat entry point (id.livechat.fullscreen_entrypoint). Instead of
-// leaving it there, move it into the playback controls, right of the Live
-// button, so it fades in and out with the controls and stays tappable.
+// the live chat entry point (id.livechat.fullscreen_entrypoint). It is moved
+// next to the Live button and shown only together with the playback controls.
+//
+// The pill must stay inside YCHLiveChatFullscreenOverlayView: it belongs to a
+// child view controller, and adding it to another view makes UIKit throw its
+// view controller hierarchy check (crash). So it is only repositioned, and the
+// whole overlay is raised above the controls so the pill can be tapped.
 @interface YCHLiveChatFullscreenOverlayView : UIView
 @end
 
 static const CGFloat kYouModChatPillGap = 8.0; // Space between the Live button and the pill.
 
+static __weak UIView *YouModChatOverlay = nil;  // YCHLiveChatFullscreenOverlayView.
 static __weak UIView *YouModChatPill = nil;     // Outermost wrapper of the pill.
 static __weak UIView *YouModChatPillHost = nil; // Controls view that holds the Live button.
 static CFTimeInterval YouModChatPillHostLastScan = 0;
@@ -695,21 +700,39 @@ static UIView *YouModFindChatPillHost(UIView *parent, NSInteger depth, NSInteger
     return nil;
 }
 
+// YouTube sets this overlay to 100% while the controls are hidden and dims it
+// to 30% while they are shown. Invert that so the pill is visible together with
+// the controls: 30% -> 100%, 100% -> 0%. Lower values (hidden by YouTube) stay.
+static CGFloat YouModChatOverlayAlpha(CGFloat alpha) {
+    if (alpha < 0.3) return alpha;
+    return fmin(1.0, fmax(0.0, (1.0 - alpha) / 0.7));
+}
+
 static void YouModUpdateChatPill(UIView *playerOverlay, UIView *chatOverlay) {
+    if (!chatOverlay) chatOverlay = YouModChatOverlay;
+    if (!chatOverlay) return;
+
     UIView *pill = YouModChatPill;
-    if (!pill && chatOverlay) {
+    if (!pill || ![pill isDescendantOfView:chatOverlay]) {
         pill = YouModFindChatPill(chatOverlay, chatOverlay);
         YouModChatPill = pill;
     }
     if (!pill) return;
 
+    // Keep the overlay above the controls (reordering only; no reparenting).
+    UIView *container = chatOverlay.superview;
+    if (container && container.subviews.lastObject != chatOverlay) {
+        [container bringSubviewToFront:chatOverlay];
+    }
+
     UIView *host = YouModChatPillHost;
-    if (!host.window && playerOverlay) {
+    if (!host.window) {
+        UIView *searchRoot = playerOverlay ?: container;
         CFTimeInterval now = CACurrentMediaTime();
-        if (now - YouModChatPillHostLastScan >= 0.5) {
+        if (searchRoot && now - YouModChatPillHostLastScan >= 0.5) {
             YouModChatPillHostLastScan = now;
             NSInteger budget = 1500;
-            host = YouModFindChatPillHost(playerOverlay, 0, &budget);
+            host = YouModFindChatPillHost(searchRoot, 0, &budget);
             YouModChatPillHost = host;
         }
     }
@@ -717,11 +740,6 @@ static void YouModUpdateChatPill(UIView *playerOverlay, UIView *chatOverlay) {
 
     CGSize size = pill.bounds.size;
     if (size.width < 1 || size.height < 1) return;
-
-    if (pill.superview != host) {
-        [host addSubview:pill];
-        [host bringSubviewToFront:pill];
-    }
 
     // Anchor to the visible Live button; fall back to the timestamp view's origin.
     CGRect anchor = CGRectNull;
@@ -738,18 +756,30 @@ static void YouModUpdateChatPill(UIView *playerOverlay, UIView *chatOverlay) {
         anchor = CGRectMake(CGRectGetMinX(timestamp.frame), CGRectGetMinY(timestamp.frame), 0, CGRectGetHeight(timestamp.frame));
     }
 
-    CGRect target = CGRectMake(CGRectGetMaxX(anchor) + kYouModChatPillGap,
+    CGRect inHost = CGRectMake(CGRectGetMaxX(anchor) + kYouModChatPillGap,
                                CGRectGetMidY(anchor) - size.height / 2,
                                size.width, size.height);
+    CGRect target = [host convertRect:inHost toView:chatOverlay];
     if (!CGRectEqualToRect(pill.frame, target)) pill.frame = target;
-    if (chatOverlay) pill.hidden = chatOverlay.hidden;
 }
 
 %hook YCHLiveChatFullscreenOverlayView
 - (void)layoutSubviews {
     %orig;
+    YouModChatOverlay = self;
     // The superview is the player overlay, which contains the controls.
     YouModUpdateChatPill(self.superview, self);
+}
+
+- (void)setAlpha:(CGFloat)alpha {
+    %orig(YouModChatOverlayAlpha(alpha));
+}
+
+// Now above the controls and full-size: let taps pass through everywhere
+// except the pill.
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    UIView *hit = %orig;
+    return hit == self ? nil : hit;
 }
 %end
 
