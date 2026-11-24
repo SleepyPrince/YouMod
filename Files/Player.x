@@ -666,6 +666,7 @@ static __weak UIView *YouModChatOverlay = nil;  // YCHLiveChatFullscreenOverlayV
 static __weak UIView *YouModChatPill = nil;     // Outermost wrapper of the pill.
 static __weak UIView *YouModChatPillHost = nil; // Controls view that holds the Live button.
 static CFTimeInterval YouModChatPillHostLastScan = 0;
+static __weak UIView *YouModChatAlphaOwner = nil; // Overlay YouTube has set an alpha on.
 
 static BOOL YouModViewIsClass(UIView *view, NSString *name) {
     return [NSStringFromClass([view class]) isEqualToString:name];
@@ -779,11 +780,17 @@ static void YouModUpdateChatPill(UIView *playerOverlay, UIView *chatOverlay) {
 - (void)layoutSubviews {
     %orig;
     YouModChatOverlay = self;
+    if (YouModChatAlphaOwner != self) {
+        // YouTube hasn't set an alpha on this new overlay yet: it starts at 100%,
+        // which means "controls hidden", so apply the hidden state now.
+        [self setAlpha:1.0];
+    }
     // The superview is the player overlay, which contains the controls.
     YouModUpdateChatPill(self.superview, self);
 }
 
 - (void)setAlpha:(CGFloat)alpha {
+    YouModChatAlphaOwner = self;
     %orig(YouModChatOverlayAlpha(alpha));
 }
 
@@ -798,92 +805,6 @@ static void YouModUpdateChatPill(UIView *playerOverlay, UIView *chatOverlay) {
     return hit == self ? nil : hit;
 }
 %end
-
-#pragma mark - TEMPORARY debug: why can't the pill be tapped?
-
-// Hold three fingers on the player for one second to copy the pill's state.
-// Remove once tapping works.
-static NSString *YouModPillDescribe(UIView *view) {
-    return [NSString stringWithFormat:@"%@ frame=%@ alpha=%.2f hidden=%d ui=%d", NSStringFromClass([view class]),
-            NSStringFromCGRect(view.frame), view.alpha, view.hidden, view.userInteractionEnabled];
-}
-
-static void YouModPillAppendRecognizers(UIView *view, NSString *label, NSMutableString *out) {
-    for (UIGestureRecognizer *gesture in view.gestureRecognizers) {
-        [out appendFormat:@"  %@ recognizer: %@ enabled=%d delegate=%@\n", label, NSStringFromClass([gesture class]),
-            gesture.enabled, gesture.delegate ? NSStringFromClass([gesture.delegate class]) : @"nil"];
-    }
-}
-
-static void YouModPillDump(UIView *playerOverlay) {
-    NSMutableString *out = [NSMutableString stringWithString:@"YouMod pill dump\n"];
-    UIView *chat = YouModChatOverlay;
-    UIView *pill = YouModChatPill;
-    UIView *host = YouModChatPillHost;
-    [out appendFormat:@"host: %@\n", host ? YouModPillDescribe(host) : @"nil"];
-    [out appendFormat:@"chatOverlay: %@\n", chat ? YouModPillDescribe(chat) : @"nil"];
-    [out appendFormat:@"pill: %@\n", pill ? YouModPillDescribe(pill) : @"nil"];
-    if (chat) {
-        NSArray<UIView *> *siblings = chat.superview.subviews;
-        [out appendFormat:@"chatOverlay index %lu of %lu in %@\n", (unsigned long)[siblings indexOfObject:chat],
-            (unsigned long)siblings.count, NSStringFromClass([chat.superview class])];
-        [out appendString:@"top siblings (front first):\n"];
-        for (NSInteger i = (NSInteger)siblings.count - 1; i >= 0 && i >= (NSInteger)siblings.count - 6; i--) {
-            [out appendFormat:@"  %ld %@\n", (long)i, YouModPillDescribe(siblings[i])];
-        }
-        YouModPillAppendRecognizers(chat, @"chatOverlay", out);
-    }
-    if (pill) {
-        YouModPillAppendRecognizers(pill, @"pill", out);
-        for (UIView *sub in pill.subviews) {
-            [out appendFormat:@"pill child: %@ id=%@\n", YouModPillDescribe(sub), sub.accessibilityIdentifier];
-            YouModPillAppendRecognizers(sub, @"pill child", out);
-        }
-        UIWindow *window = pill.window;
-        if (window) {
-            CGPoint center = [pill convertPoint:CGPointMake(pill.bounds.size.width / 2, pill.bounds.size.height / 2) toView:window];
-            UIView *hit = [window hitTest:center withEvent:nil];
-            [out appendFormat:@"hitTest at pill center %@:\n", NSStringFromCGPoint(center)];
-            for (int i = 0; hit && i < 7; i++, hit = hit.superview) {
-                [out appendFormat:@"  %@\n", YouModPillDescribe(hit)];
-            }
-        }
-    }
-    YouModPillAppendRecognizers(playerOverlay, @"playerOverlay", out);
-
-    [UIPasteboard generalPasteboard].string = out;
-    UINotificationFeedbackGenerator *haptic = [[UINotificationFeedbackGenerator alloc] init];
-    [haptic notificationOccurred:UINotificationFeedbackTypeSuccess];
-}
-
-@interface YouModPillDumper : NSObject
-+ (instancetype)shared;
-- (void)handle:(UILongPressGestureRecognizer *)gesture;
-@end
-
-@implementation YouModPillDumper
-+ (instancetype)shared {
-    static YouModPillDumper *instance;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ instance = [[YouModPillDumper alloc] init]; });
-    return instance;
-}
-- (void)handle:(UILongPressGestureRecognizer *)gesture {
-    if (gesture.state == UIGestureRecognizerStateBegan && gesture.view) YouModPillDump(gesture.view);
-}
-@end
-
-static void YouModPillInstallDump(UIView *overlay) {
-    for (UIGestureRecognizer *existing in overlay.gestureRecognizers) {
-        if ([existing.name isEqualToString:@"YouModPillDump"]) return;
-    }
-    UILongPressGestureRecognizer *press = [[UILongPressGestureRecognizer alloc] initWithTarget:[YouModPillDumper shared] action:@selector(handle:)];
-    press.name = @"YouModPillDump";
-    press.numberOfTouchesRequired = 3;
-    press.minimumPressDuration = 1.0;
-    press.cancelsTouchesInView = NO;
-    [overlay addGestureRecognizer:press];
-}
 
 %hook YTMainAppVideoPlayerOverlayView
 - (void)setLongPressGestureRecognizer:(id)arg {
@@ -905,7 +826,6 @@ static void YouModPillInstallDump(UIView *overlay) {
     %orig;
     if (IS_ENABLED(HideCastButtonPlayer)) self.playbackRouteButton.hidden = YES;
     YouModUpdateChatPill(self, nil);
-    YouModPillInstallDump(self);
 }
 %end
 
