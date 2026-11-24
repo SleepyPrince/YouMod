@@ -767,11 +767,25 @@ static void YouModUpdateChatPill(UIView *playerOverlay, UIView *chatOverlay) {
         anchor = CGRectMake(CGRectGetMinX(timestamp.frame), CGRectGetMinY(timestamp.frame), 0, CGRectGetHeight(timestamp.frame));
     }
 
-    CGRect inHost = CGRectMake(CGRectGetMaxX(anchor) + kYouModChatPillGap,
-                               CGRectGetMidY(anchor) - size.height / 2,
-                               size.width, size.height);
-    CGRect target = [host convertRect:inHost toView:chatOverlay];
+    // Scale the pill's contents down to the height of the Live button. Only the
+    // sublayers are scaled (about the pill's center), so the pill keeps its natural
+    // frame, which YouTube's own layout keeps writing.
+    CGFloat anchorHeight = CGRectGetHeight(anchor);
+    CGFloat scale = anchorHeight > 0 ? fmin(1.0, anchorHeight / size.height) : 1.0;
+    CGSize scaled = CGSizeMake(size.width * scale, size.height * scale);
+
+    // Center the scaled pill right of the anchor, then place the natural frame
+    // around that center.
+    CGPoint centerInHost = CGPointMake(CGRectGetMaxX(anchor) + kYouModChatPillGap + scaled.width / 2,
+                                       CGRectGetMidY(anchor));
+    CGPoint center = [host convertPoint:centerInHost toView:chatOverlay];
+    CGRect target = CGRectMake(center.x - size.width / 2, center.y - size.height / 2, size.width, size.height);
     if (!CGRectEqualToRect(pill.frame, target)) pill.frame = target;
+
+    CATransform3D transform = CATransform3DMakeScale(scale, scale, 1);
+    if (!CATransform3DEqualToTransform(pill.layer.sublayerTransform, transform)) {
+        pill.layer.sublayerTransform = transform;
+    }
     YouModEnablePillInteraction(pill);
     chatOverlay.userInteractionEnabled = YES;
 }
@@ -799,10 +813,11 @@ static void YouModUpdateChatPill(UIView *playerOverlay, UIView *chatOverlay) {
 }
 
 // Now above the controls and full-size: let taps pass through everywhere
-// except the pill.
+// except the visible pill.
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
     UIView *hit = %orig;
-    return hit == self ? nil : hit;
+    // Also pass through the pill's empty natural frame around the scaled contents.
+    return (hit == self || hit == YouModChatPill) ? nil : hit;
 }
 %end
 
